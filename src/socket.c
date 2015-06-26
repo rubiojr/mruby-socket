@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -24,6 +25,10 @@
 #include "mruby/variable.h"
 #include "error.h"
 
+//#ifdef HAVE_IFADDRS_H
+#include <ifaddrs.h>
+//#endif
+
 #define E_SOCKET_ERROR             (mrb_class_get(mrb, "SocketError"))
 
 #if !defined(mrb_cptr)
@@ -31,6 +36,61 @@
 #define mrb_cptr(o) mrb_voidp(o)
 #define mrb_cptr_p(o) mrb_voidp_p(o)
 #endif
+
+typedef struct rb_ifaddr_tag rb_ifaddr_t;
+typedef struct rb_ifaddr_root_tag rb_ifaddr_root_t;
+
+struct rb_ifaddr_tag {
+    int ord;
+    struct ifaddrs *ifaddr;
+    rb_ifaddr_root_t *root;
+};
+
+struct rb_ifaddr_root_tag {
+    int refcount;
+    int numifaddrs;
+    rb_ifaddr_t ary[1];
+};
+
+static rb_ifaddr_root_t *
+get_root(const rb_ifaddr_t *ifaddr)
+{
+  return (rb_ifaddr_root_t *)((char *)&ifaddr[-ifaddr->ord] -
+                              offsetof(rb_ifaddr_root_t, ary));
+}
+
+static void
+ifaddr_mark(void *ptr)
+{
+}
+
+static void
+ifaddr_free(mrb_state *mrb, void *ptr)
+{
+    rb_ifaddr_t *ifaddr = ptr;
+    rb_ifaddr_root_t *root = get_root(ifaddr);
+    root->refcount--;
+    if (root->refcount == 0) {
+        freeifaddrs(root->ary[0].ifaddr);
+        free(root);
+    }
+}
+
+static size_t
+ifaddr_memsize(const void *ptr)
+{
+    const rb_ifaddr_t *ifaddr;
+    const rb_ifaddr_root_t *root;
+    if (ptr == NULL)
+        return 0;
+    ifaddr = ptr;
+    root = get_root(ifaddr);
+    return sizeof(rb_ifaddr_root_t) + (root->numifaddrs - 1) * sizeof(rb_ifaddr_t);
+}
+
+static const mrb_data_type ifaddr_type = {
+    "socket/ifaddr", ifaddr_free
+};
 
 static mrb_value
 mrb_addrinfo_getaddrinfo(mrb_state *mrb, mrb_value klass)
@@ -619,10 +679,77 @@ mrb_tcpsocket_allocate(mrb_state *mrb, mrb_value klass)
   return mrb_obj_value((struct RObject*)mrb_obj_alloc(mrb, ttype, c));
 }
 
+static mrb_value 
+mrb_socket_getifaddrs(mrb_state *mrb)
+{
+  int ret;
+  int numifaddrs, i;
+  struct ifaddrs *ifaddrs, *ifa;
+  rb_ifaddr_root_t *root;
+  mrb_value result, addr;
+
+  ret = getifaddrs(&ifaddrs);
+  if (ret == -1)
+      mrb_sys_fail(mrb, "getifaddrs");
+
+  if (!ifaddrs) {
+    return mrb_ary_new(mrb);
+  }
+
+  numifaddrs = 0;
+  for (ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next)
+      numifaddrs++;
+
+  //addr = TypedData_Wrap_Struct(rb_cSockIfaddr, &ifaddr_type, 0);
+  // mrb_data_object_alloc(mrb_state *mrb, struct RClass* klass, void *datap, const mrb_data_type *type);
+  addr = mrb_obj_value(mrb_obj_alloc(mrb, MRB_TT_DATA, mrb_class_get_under(mrb, mrb_class_get(mrb, "Socket"), "Ifaddr")));
+  root = malloc(sizeof(rb_ifaddr_root_t) + (numifaddrs-1) * sizeof(rb_ifaddr_t));
+  root->refcount = 0;
+  root->numifaddrs = numifaddrs;
+
+  ifa = ifaddrs;
+  for (i = 0; i < numifaddrs; i++) {
+      root->ary[i].ord = i;
+      root->ary[i].ifaddr = ifa;
+      root->ary[i].root = root;
+      ifa = ifa->ifa_next;
+  }
+  DATA_PTR(addr) = &root->ary[0];
+  root->refcount++;
+
+  result = mrb_ary_new_capa(mrb, numifaddrs);
+  mrb_ary_push(mrb, result, addr);
+  for (i = 1; i < numifaddrs; i++) {
+      addr = mrb_obj_value(mrb_obj_alloc(mrb, MRB_TT_DATA, mrb_class_get_under(mrb, mrb_class_get(mrb, "Socket"), "Ifaddr")));
+      root->refcount++;
+      mrb_ary_push(mrb, result, addr);
+  }
+
+  return result;
+}
+
+static int
+mrb_socket_ifaddr_flags(mrb_state *mrb)
+{
+  return 0;
+}
+
+static int
+mrb_socket_ifaddr_ifindex(mrb_state *mrb)
+{
+  return 0;
+}
+
+static mrb_value 
+mrb_socket_ifaddr_name(mrb_state *mrb)
+{
+  return mrb_str_new_cstr(mrb, "string from c-string");
+}
+
 void
 mrb_mruby_socket_gem_init(mrb_state* mrb)
 {
-  struct RClass *io, *ai, *sock, *bsock, *ipsock, *tcpsock, *udpsock, *usock;
+  struct RClass *io, *ai, *sock, *bsock, *ipsock, *tcpsock, *udpsock, *usock, *ifaddr;
   struct RClass *constants;
 
   ai = mrb_define_class(mrb, "Addrinfo", mrb->object_class);
@@ -675,6 +802,7 @@ mrb_mruby_socket_gem_init(mrb_state* mrb)
   mrb_define_class_method(mrb, sock, "sockaddr_un", mrb_socket_sockaddr_un, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, sock, "socketpair", mrb_socket_socketpair, MRB_ARGS_REQ(3));
   //mrb_define_method(mrb, sock, "sysaccept", mrb_socket_accept, MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, sock, "getifaddrs", mrb_socket_getifaddrs, MRB_ARGS_NONE());
 
   usock = mrb_define_class(mrb, "UNIXSocket", bsock);
   //mrb_define_class_method(mrb, usock, "pair", mrb_unixsocket_open, MRB_ARGS_OPT(2));
@@ -683,6 +811,12 @@ mrb_mruby_socket_gem_init(mrb_state* mrb)
   //mrb_define_method(mrb, usock, "recv_io", mrb_unixsocket_peeraddr, MRB_ARGS_NONE());
   //mrb_define_method(mrb, usock, "recvfrom", mrb_unixsocket_peeraddr, MRB_ARGS_NONE());
   //mrb_define_method(mrb, usock, "send_io", mrb_unixsocket_peeraddr, MRB_ARGS_NONE());
+  //
+  ifaddr = mrb_define_class_under(mrb, sock, "Ifaddr", mrb->object_class);
+  MRB_SET_INSTANCE_TT(ifaddr, MRB_TT_DATA);
+  mrb_define_method(mrb, ifaddr, "flags", mrb_socket_ifaddr_flags, 0);
+  mrb_define_method(mrb, ifaddr, "name", mrb_socket_ifaddr_name, 0);
+  mrb_define_method(mrb, ifaddr, "ifindex", mrb_socket_ifaddr_ifindex, 0);
 
   constants = mrb_define_module_under(mrb, sock, "Constants");
 
